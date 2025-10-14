@@ -37,10 +37,10 @@ from music_assistant_models.media_items import (
     Album,
     Artist,
     AudioFormat,
+    BrowseFolder,
     ItemMapping,
     MediaItemImage,
     MediaItemType,
-    MediaItemTypeOrItemMapping,
     Playlist,
     ProviderMapping,
     RecommendationFolder,
@@ -50,11 +50,33 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import CACHE_CATEGORY_DEFAULT, CACHE_CATEGORY_RECOMMENDATIONS
+from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
+from music_assistant.helpers.util import infer_album_type
 from music_assistant.models.music_provider import MusicProvider
 
 from .auth_manager import ManualAuthenticationHelper, TidalAuthManager
+from .constants import (
+    BROWSE_URL,
+    CACHE_CATEGORY_ISRC_MAP,
+    CACHE_CATEGORY_RECOMMENDATIONS,
+    CACHE_KEY_RECOMMENDATIONS_ALL,
+    CONF_ACTION_CLEAR_AUTH,
+    CONF_ACTION_COMPLETE_PKCE_LOGIN,
+    CONF_ACTION_START_PKCE_LOGIN,
+    CONF_AUTH_TOKEN,
+    CONF_EXPIRY_TIME,
+    CONF_OOPS_URL,
+    CONF_QUALITY,
+    CONF_REFRESH_TOKEN,
+    CONF_TEMP_SESSION,
+    CONF_USER_ID,
+    DEFAULT_LIMIT,
+    LABEL_COMPLETE_PKCE_LOGIN,
+    LABEL_OOPS_URL,
+    LABEL_START_PKCE_LOGIN,
+    RESOURCES_URL,
+)
 from .tidal_page_parser import TidalPageParser
 
 if TYPE_CHECKING:
@@ -67,37 +89,27 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-TOKEN_TYPE = "Bearer"
-
-# Actions
-CONF_ACTION_START_PKCE_LOGIN = "start_pkce_login"
-CONF_ACTION_COMPLETE_PKCE_LOGIN = "auth"
-CONF_ACTION_CLEAR_AUTH = "clear_auth"
-
-# Intermediate steps
-CONF_TEMP_SESSION = "temp_session"
-CONF_OOPS_URL = "oops_url"
-
-# Config keys
-CONF_AUTH_TOKEN = "auth_token"
-CONF_REFRESH_TOKEN = "refresh_token"
-CONF_USER_ID = "user_id"
-CONF_EXPIRY_TIME = "expiry_time"
-CONF_COUNTRY_CODE = "country_code"
-CONF_SESSION_ID = "session_id"
-CONF_QUALITY = "quality"
-
-# Labels
-LABEL_START_PKCE_LOGIN = "start_pkce_login_label"
-LABEL_OOPS_URL = "oops_url_label"
-LABEL_COMPLETE_PKCE_LOGIN = "complete_pkce_login_label"
-
-BROWSE_URL = "https://tidal.com/browse"
-RESOURCES_URL = "https://resources.tidal.com/images"
-
-DEFAULT_LIMIT = 50
 
 T = TypeVar("T")
+
+SUPPORTED_FEATURES = {
+    ProviderFeature.LIBRARY_ARTISTS,
+    ProviderFeature.LIBRARY_ALBUMS,
+    ProviderFeature.LIBRARY_TRACKS,
+    ProviderFeature.LIBRARY_PLAYLISTS,
+    ProviderFeature.ARTIST_ALBUMS,
+    ProviderFeature.ARTIST_TOPTRACKS,
+    ProviderFeature.SEARCH,
+    ProviderFeature.LIBRARY_ARTISTS_EDIT,
+    ProviderFeature.LIBRARY_ALBUMS_EDIT,
+    ProviderFeature.LIBRARY_TRACKS_EDIT,
+    ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
+    ProviderFeature.PLAYLIST_CREATE,
+    ProviderFeature.SIMILAR_TRACKS,
+    ProviderFeature.BROWSE,
+    ProviderFeature.PLAYLIST_TRACKS_EDIT,
+    ProviderFeature.RECOMMENDATIONS,
+}
 
 
 async def setup(
@@ -316,7 +328,7 @@ class TidalProvider(MusicProvider):
 
     def __init__(self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig):
         """Initialize Tidal provider."""
-        super().__init__(mass, manifest, config)
+        super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
         self.auth = TidalAuthManager(
             http_session=mass.http_session,
             config_updater=self._update_auth_config,
@@ -345,10 +357,8 @@ class TidalProvider(MusicProvider):
         # Handle conversion from ISO format to timestamp if needed
         if isinstance(expires_at, str) and "T" in expires_at:
             # This looks like an ISO format date
-            import datetime
-
             try:
-                dt = datetime.datetime.fromisoformat(expires_at)
+                dt = datetime.fromisoformat(expires_at)
                 # Convert to timestamp
                 expires_at = dt.timestamp()
                 # Update the config with the numeric value
@@ -376,28 +386,6 @@ class TidalProvider(MusicProvider):
         user_info = self._extract_data(api_result)
         logged_in_user = await self.get_user(str(user_info.get("userId")))
         await self.auth.update_user_info(logged_in_user, str(user_info.get("sessionId")))
-
-    @property
-    def supported_features(self) -> set[ProviderFeature]:
-        """Return the features supported by this Provider."""
-        return {
-            ProviderFeature.LIBRARY_ARTISTS,
-            ProviderFeature.LIBRARY_ALBUMS,
-            ProviderFeature.LIBRARY_TRACKS,
-            ProviderFeature.LIBRARY_PLAYLISTS,
-            ProviderFeature.ARTIST_ALBUMS,
-            ProviderFeature.ARTIST_TOPTRACKS,
-            ProviderFeature.SEARCH,
-            ProviderFeature.LIBRARY_ARTISTS_EDIT,
-            ProviderFeature.LIBRARY_ALBUMS_EDIT,
-            ProviderFeature.LIBRARY_TRACKS_EDIT,
-            ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
-            ProviderFeature.PLAYLIST_CREATE,
-            ProviderFeature.SIMILAR_TRACKS,
-            ProviderFeature.BROWSE,
-            ProviderFeature.PLAYLIST_TRACKS_EDIT,
-            ProviderFeature.RECOMMENDATIONS,
-        }
 
     #
     # API REQUEST HELPERS & DECORATORS
@@ -596,13 +584,22 @@ class TidalProvider(MusicProvider):
         item_key: str = "items",
         nested_key: str | None = None,
         limit: int = DEFAULT_LIMIT,
+        cursor_based: bool = False,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
         """Paginate through all items from a Tidal API endpoint."""
         offset = 0
+        cursor = None
+
         while True:
             # Get a batch of items
-            params = {"limit": limit, "offset": offset}
+            params = {"limit": limit}
+            if cursor_based:
+                if cursor:
+                    params["cursor"] = cursor  # Add cursor if available
+            else:
+                params["offset"] = offset  # Use offset for offset-based pagination
+
             if "params" in kwargs:
                 params.update(kwargs.pop("params"))
 
@@ -620,13 +617,14 @@ class TidalProvider(MusicProvider):
                     yield item[nested_key]
                 else:
                     yield item
+            # Update cursor or offset for the next batch
+            if cursor_based:
+                cursor = response.get("cursor")  # Update cursor from the response
+                if not cursor:
+                    break  # Stop if no next cursor is provided
 
             # Update offset for next batch
             offset += len(items)
-
-            # Stop if we've received fewer items than the limit
-            if len(items) < limit:
-                break
 
     def _extract_data(
         self, api_result: dict[str, Any] | tuple[dict[str, Any], str]
@@ -651,6 +649,7 @@ class TidalProvider(MusicProvider):
         api_result = await self._get_data(f"users/{prov_user_id}")
         return self._extract_data(api_result)
 
+    @use_cache(3600 * 24 * 14)  # Cache for 14 days
     async def search(
         self,
         search_query: str,
@@ -733,6 +732,7 @@ class TidalProvider(MusicProvider):
 
         return parsed_results
 
+    @use_cache(3600 * 24)  # Cache for 1 day
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Get similar tracks for given track id."""
         try:
@@ -750,6 +750,7 @@ class TidalProvider(MusicProvider):
     # ITEM RETRIEVAL METHODS
     #
 
+    @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get artist details for given artist id."""
         try:
@@ -761,6 +762,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from err
 
+    @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_album(self, prov_album_id: str) -> Album:
         """Get album details for given album id."""
         try:
@@ -772,6 +774,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Album {prov_album_id} not found") from err
 
+    @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_track(self, prov_track_id: str) -> Track:
         """Get track details for given track id."""
         try:
@@ -791,6 +794,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Track {prov_track_id} not found") from err
 
+    @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get playlist details for given playlist id."""
         # Check if this is a mix by ID prefix
@@ -881,6 +885,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Mix {prov_mix_id} not found") from err
 
+    @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         try:
@@ -894,6 +899,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Album {prov_album_id} not found") from err
 
+    @use_cache(3600 * 24 * 7)  # Cache for 7 days
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of all albums for the given artist."""
         try:
@@ -907,6 +913,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from err
 
+    @use_cache(3600 * 24 * 7)  # Cache for 7 days
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of 10 most popular tracks for the given artist."""
         try:
@@ -922,6 +929,7 @@ class TidalProvider(MusicProvider):
         except (ClientError, KeyError, ValueError) as err:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from err
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks for either regular playlists or Tidal mixes."""
         page_size = 200
@@ -1005,9 +1013,10 @@ class TidalProvider(MusicProvider):
     async def recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders."""
         # Check cache first
-        cache_key = f"tidal_recommendations_{self.lookup_key}"
         cached_recommendations: list[RecommendationFolder] = await self.mass.cache.get(
-            cache_key, category=CACHE_CATEGORY_RECOMMENDATIONS, base_key=self.lookup_key
+            CACHE_KEY_RECOMMENDATIONS_ALL,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_RECOMMENDATIONS,
         )
 
         if cached_recommendations:
@@ -1039,10 +1048,10 @@ class TidalProvider(MusicProvider):
 
             # Cache the results for 1 hour (3600 seconds)
             await self.mass.cache.set(
-                cache_key,
-                results,
+                key=CACHE_KEY_RECOMMENDATIONS_ALL,
+                data=results,
+                provider=self.instance_id,
                 category=CACHE_CATEGORY_RECOMMENDATIONS,
-                base_key=self.lookup_key,
                 expiration=3600,
             )
 
@@ -1169,7 +1178,7 @@ class TidalProvider(MusicProvider):
                 item_id=item_id,
                 name=module_title,
                 provider=self.lookup_key,
-                items=UniqueList[MediaItemTypeOrItemMapping](unique_items),
+                items=UniqueList[MediaItemType | ItemMapping | BrowseFolder](unique_items),
                 subtitle=f"From {page_name} • {len(unique_items)} items",
                 translation_key=item_id,
                 icon=get_icon_for_type(content_type),
@@ -1276,9 +1285,8 @@ class TidalProvider(MusicProvider):
     async def _get_track_by_isrc(self, item_id: str) -> Track | None:
         """Get track by ISRC from library item, with caching."""
         # Try to get from cache first
-        cache_key = f"isrc_map_{item_id}"
         cached_track_id = await self.mass.cache.get(
-            cache_key, category=CACHE_CATEGORY_DEFAULT, base_key=self.lookup_key
+            item_id, provider=self.instance_id, category=CACHE_CATEGORY_ISRC_MAP
         )
 
         if cached_track_id:
@@ -1290,7 +1298,7 @@ class TidalProvider(MusicProvider):
             except MediaNotFoundError:
                 # Track no longer exists, invalidate cache
                 await self.mass.cache.delete(
-                    cache_key, category=CACHE_CATEGORY_DEFAULT, base_key=self.lookup_key
+                    item_id, provider=self.instance_id, category=CACHE_CATEGORY_ISRC_MAP
                 )
 
         # Lookup by ISRC if no cache or cached track not found
@@ -1331,10 +1339,12 @@ class TidalProvider(MusicProvider):
 
         # Cache the mapping for future use
         await self.mass.cache.set(
-            cache_key,
-            track_id,
-            category=CACHE_CATEGORY_DEFAULT,
-            base_key=self.lookup_key,
+            key=item_id,
+            data=track_id,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_ISRC_MAP,
+            persistent=True,
+            expiration=(86400 * 90),
         )
 
         return await self.get_track(track_id)
@@ -1387,17 +1397,16 @@ class TidalProvider(MusicProvider):
             self.logger.debug("Page '%s' indexed with: %s", page_path, parser.content_stats)
 
             # Cache the parser data
-            cache_key = f"tidal_page_{page_path}"
             cache_data = {
                 "module_map": parser._module_map,
                 "content_map": parser._content_map,
                 "parsed_at": parser._parsed_at,
             }
             await self.mass.cache.set(
-                cache_key,
-                cache_data,
+                key=page_path,
+                data=cache_data,
+                provider=self.instance_id,
                 category=CACHE_CATEGORY_RECOMMENDATIONS,
-                base_key=self.lookup_key,
                 expiration=self.page_cache_ttl,
             )
 
@@ -1447,7 +1456,10 @@ class TidalProvider(MusicProvider):
         mix_path = "favorites/mixes"
 
         async for mix_item in self._paginate_api(
-            mix_path, item_key="items", base_url=self.BASE_URL_V2
+            mix_path,
+            item_key="items",
+            base_url=self.BASE_URL_V2,
+            cursor_based=True,
         ):
             if mix_item and mix_item.get("id"):
                 yield self._parse_playlist(mix_item, is_mix=True)
@@ -1719,6 +1731,11 @@ class TidalProvider(MusicProvider):
         elif album_type == "SINGLE":
             album.album_type = AlbumType.SINGLE
 
+        # Try inference - override if it finds something more specific
+        inferred_type = infer_album_type(name, version)
+        if inferred_type in (AlbumType.SOUNDTRACK, AlbumType.LIVE):
+            album.album_type = inferred_type
+
         # Safely parse year
         if release_date := album_obj.get("releaseDate", ""):
             try:
@@ -1874,12 +1891,6 @@ class TidalProvider(MusicProvider):
         )
 
         # Metadata - different fields based on type
-        if is_mix:
-            playlist.cache_checksum = str(playlist_obj.get("updated", ""))
-        else:
-            playlist.cache_checksum = str(playlist_obj.get("lastUpdated", ""))
-            if "popularity" in playlist_obj:
-                playlist.metadata.popularity = playlist_obj.get("popularity", 0)
 
         # Add the description from the subtitle for mixes
         if is_mix:

@@ -54,6 +54,7 @@ from plexapi.myplex import MyPlexAccount, MyPlexPinLogin
 from plexapi.server import PlexServer
 
 from music_assistant.constants import UNKNOWN_ARTIST
+from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.auth import AuthenticationHelper
 from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.helpers.util import parse_title_and_version
@@ -89,6 +90,16 @@ FAKE_ARTIST_PREFIX = "_fake://"
 
 AUTH_TOKEN_UNAUTH = "local_auth"
 
+SUPPORTED_FEATURES = {
+    ProviderFeature.LIBRARY_ARTISTS,
+    ProviderFeature.LIBRARY_ALBUMS,
+    ProviderFeature.LIBRARY_TRACKS,
+    ProviderFeature.LIBRARY_PLAYLISTS,
+    ProviderFeature.BROWSE,
+    ProviderFeature.SEARCH,
+    ProviderFeature.ARTIST_ALBUMS,
+}
+
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -98,7 +109,7 @@ async def setup(
         msg = "Invalid login credentials"
         raise LoginFailed(msg)
 
-    return PlexProvider(mass, manifest, config)
+    return PlexProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
 async def get_config_entries(  # noqa: PLR0915
@@ -383,19 +394,6 @@ class PlexProvider(MusicProvider):
             raise SetupFailedError from err
 
     @property
-    def supported_features(self) -> set[ProviderFeature]:
-        """Return a list of supported features."""
-        return {
-            ProviderFeature.LIBRARY_ARTISTS,
-            ProviderFeature.LIBRARY_ALBUMS,
-            ProviderFeature.LIBRARY_TRACKS,
-            ProviderFeature.LIBRARY_PLAYLISTS,
-            ProviderFeature.BROWSE,
-            ProviderFeature.SEARCH,
-            ProviderFeature.ARTIST_ALBUMS,
-        }
-
-    @property
     def is_streaming_provider(self) -> bool:
         """
         Return True if the provider is a streaming provider.
@@ -425,17 +423,34 @@ class PlexProvider(MusicProvider):
         return cast("PlexObjectT", results)
 
     def _get_item_mapping(self, media_type: MediaType, key: str, name: str) -> ItemMapping:
-        name, version = parse_title_and_version(name)
-        if media_type in (MediaType.ALBUM, MediaType.TRACK):
-            name, version = parse_title_and_version(name)
-        else:
-            version = ""
+        """Get item mapping for a given media type, key, and name."""
+        if not name:
+            self.logger.info(
+                "Received None or empty name for media item. Media type: %s, Key: %s",
+                media_type,
+                key,
+            )
+            name = "[Unknown]"
+
+        mapped_name, mapped_version = parse_title_and_version(name)
+
+        if not mapped_name:
+            self.logger.info(
+                "Failed to map name for media item. Media type: %s, Key: %s, Original name: %s",
+                media_type,
+                key,
+                name,
+            )
+            mapped_name = "[Unknown]"
+        if not mapped_version and media_type not in (MediaType.ALBUM, MediaType.TRACK):
+            mapped_version = ""
+
         return ItemMapping(
             media_type=media_type,
             item_id=key,
             provider=self.lookup_key,
-            name=name,
-            version=version,
+            name=mapped_name,
+            version=mapped_version,
         )
 
     async def _get_or_create_artist_by_name(self, artist_name: str) -> Artist | ItemMapping:
@@ -646,8 +661,6 @@ class PlexProvider(MusicProvider):
                 ]
             )
         playlist.is_editable = not plex_playlist.smart
-        playlist.cache_checksum = str(plex_playlist.updatedAt.timestamp())
-
         return playlist
 
     async def _parse_track(self, plex_track: PlexTrack) -> Track:
@@ -727,6 +740,7 @@ class PlexProvider(MusicProvider):
 
         return track
 
+    @use_cache(3600)  # Cache for 1 hour
     async def search(
         self,
         search_query: str,
@@ -810,10 +824,25 @@ class PlexProvider(MusicProvider):
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Retrieve library tracks from Plex Music."""
-        tracks_obj = await self._search_track(None, limit=99999)
-        for track in tracks_obj:
-            yield await self._parse_track(track)
+        page_size = 500
+        offset = 0
+        while True:
+            batch = cast(
+                "list[PlexTrack]",
+                await self._run_async(
+                    self._plex_library.searchTracks,
+                    title=None,
+                    limit=page_size,
+                    offset=offset,
+                ),
+            )
+            if not batch:
+                break
+            for plex_track in batch:
+                yield await self._parse_track(plex_track)
+            offset += page_size
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
         if plex_album := await self._get_data(prov_album_id, PlexAlbum):
@@ -821,6 +850,7 @@ class PlexProvider(MusicProvider):
         msg = f"Item {prov_album_id} not found"
         raise MediaNotFoundError(msg)
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         plex_album: PlexAlbum = await self._get_data(prov_album_id, PlexAlbum)
@@ -832,6 +862,7 @@ class PlexProvider(MusicProvider):
             tracks.append(track)
         return tracks
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
         if prov_artist_id.startswith(FAKE_ARTIST_PREFIX):
@@ -849,6 +880,7 @@ class PlexProvider(MusicProvider):
         msg = f"Item {prov_artist_id} not found"
         raise MediaNotFoundError(msg)
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
         if plex_track := await self._get_data(prov_track_id, PlexTrack):
@@ -856,6 +888,7 @@ class PlexProvider(MusicProvider):
         msg = f"Item {prov_track_id} not found"
         raise MediaNotFoundError(msg)
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
         if plex_playlist := await self._get_data(prov_playlist_id, PlexPlaylist):
@@ -863,6 +896,7 @@ class PlexProvider(MusicProvider):
         msg = f"Item {prov_playlist_id} not found"
         raise MediaNotFoundError(msg)
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
         result: list[Track] = []
@@ -878,6 +912,7 @@ class PlexProvider(MusicProvider):
                 result.append(track)
         return result
 
+    @use_cache(3600 * 3)  # Cache for 3 hours
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
         if not prov_artist_id.startswith(FAKE_ARTIST_PREFIX):

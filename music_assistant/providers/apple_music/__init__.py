@@ -1,4 +1,17 @@
-"""Apple Music musicprovider support for MusicAssistant."""
+"""
+Apple Music musicprovider support for MusicAssistant.
+
+TODO MUSIC_APP_TOKEN expires after 6 months so should have a distribution mechanism outside
+  compulsory application updates. It is only a semi-private key in JWT format so code be refreshed
+  daily by a GitHub action and downloaded by the provider each initialise.
+TODO Widevine keys can be obtained dynamically from Apple Music API rather than copied into Docker
+  build. This is undocumented but @maxlyth has a working example.
+TODO MUSIC_USER_TOKEN must be refreshed (~min 180 days) and needs mechanism to prompt user to
+  re-authenticate in browser.
+TODO Current provider ignores private tracks that are not available in the storefront catalog as
+  streamable url is derived from the catalog id. It is undecumented but @maxlyth has a working
+  example to get a streamable url from the library id.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +20,7 @@ import json
 import os
 import pathlib
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 import aiofiles
@@ -19,6 +33,7 @@ from music_assistant_models.enums import (
     ContentType,
     ExternalID,
     ImageType,
+    MediaType,
     ProviderFeature,
     StreamType,
 )
@@ -35,21 +50,23 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemImage,
     MediaItemType,
-    MediaType,
     Playlist,
     ProviderMapping,
     SearchResults,
     Track,
+    UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
 from pywidevine import PSSH, Cdm, Device, DeviceTypes
 from pywidevine.license_protocol_pb2 import WidevinePsshData
 
+from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.auth import AuthenticationHelper
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.playlists import fetch_playlist
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
+from music_assistant.helpers.util import infer_album_type
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -82,13 +99,15 @@ UNKNOWN_PLAYLIST_NAME = "Unknown Apple Music Playlist"
 
 CONF_MUSIC_APP_TOKEN = "music_app_token"
 CONF_MUSIC_USER_TOKEN = "music_user_token"
+CONF_MUSIC_USER_TOKEN_TIMESTAMP = "music_user_token_timestamp"
+CACHE_CATEGORY_DECRYPT_KEY = 1
 
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
-    return AppleMusicProvider(mass, manifest, config)
+    return AppleMusicProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
 async def get_config_entries(
@@ -126,42 +145,67 @@ async def get_config_entries(
             default_app_token_valid = True
 
     # Action is to launch MusicKit flow
-    if action == "CONF_ACTION_AUTH":
-        # TODO: check the developer token is valid otherwise user is going to have bad experience
-        async with AuthenticationHelper(mass, values["session_id"]) as auth_helper:
+    if action == "CONF_ACTION_AUTH" and default_app_token_valid:
+        callback_method = "POST"
+        async with AuthenticationHelper(mass, values["session_id"], callback_method) as auth_helper:
             callback_url = auth_helper.callback_url
             flow_base_path = f"apple_music_auth/{values['session_id']}/"
             flow_timeout = 600
             parent_file_path = pathlib.Path(__file__).parent.resolve()
+            base_url = f"{mass.webserver.base_url}/{flow_base_path}"
+            flow_base_url = f"{base_url}index.html"
 
             async def serve_mk_auth_page(request: web.Request) -> web.Response:
                 auth_html_path = parent_file_path.joinpath("musickit_auth/musickit_wrapper.html")
-                return web.FileResponse(auth_html_path, headers={"content-type": "text/html"})
+                return web.FileResponse(
+                    auth_html_path,
+                    headers={"content-type": "text/html"},
+                )
 
             async def serve_mk_auth_css(request: web.Request) -> web.Response:
                 auth_css_path = parent_file_path.joinpath("musickit_auth/musickit_wrapper.css")
-                return web.FileResponse(auth_css_path, headers={"content-type": "text/css"})
+                return web.FileResponse(
+                    auth_css_path,
+                    headers={
+                        "content-type": "text/css",
+                    },
+                )
 
             async def serve_mk_glue(request: web.Request) -> web.Response:
-                return_html = f"const app_token='{values[CONF_MUSIC_APP_TOKEN]}';"
-                return_html += f"const user_token='{values[CONF_MUSIC_USER_TOKEN]}';"
-                return_html += f"const return_url='{callback_url}';"
-                return_html += f"const flow_timeout={flow_timeout - 10};"
-                return_html += f"const mass_buid='{mass.version}';"
-                return web.Response(body=return_html, headers={"content-type": "text/javascript"})
+                return_html = f"""
+                const return_url='{callback_url}';
+                const base_url='{base_url}';
+                const app_token='{values[CONF_MUSIC_APP_TOKEN]}';
+                const callback_method='{callback_method}';
+                const user_token='{
+                    values[CONF_MUSIC_USER_TOKEN]
+                    if validate_user_token(values[CONF_MUSIC_USER_TOKEN])
+                    else ""
+                }';
+                const user_token_timestamp='{values[CONF_MUSIC_USER_TOKEN_TIMESTAMP]}';
+                const flow_timeout={max([flow_timeout - 10, 60])};
+                const flow_start_time={int(time.time())};
+                const mass_version='{mass.version}';
+                """
+                return web.Response(
+                    body=return_html,
+                    headers={
+                        "content-type": "text/javascript",
+                    },
+                )
 
             mass.webserver.register_dynamic_route(
                 f"/{flow_base_path}index.html", serve_mk_auth_page
             )
             mass.webserver.register_dynamic_route(f"/{flow_base_path}index.css", serve_mk_auth_css)
             mass.webserver.register_dynamic_route(f"/{flow_base_path}index.js", serve_mk_glue)
-            flow_base_url = f"{mass.webserver.base_url}/{flow_base_path}index.html"
+
             try:
-                values[CONF_MUSIC_USER_TOKEN] = (
-                    await auth_helper.authenticate(flow_base_url, flow_timeout)
-                )["music-user-token"]
+                result = await auth_helper.authenticate(flow_base_url, flow_timeout)
+                values[CONF_MUSIC_USER_TOKEN] = result["music-user-token"]
+                values[CONF_MUSIC_USER_TOKEN_TIMESTAMP] = result["music-user-token-timestamp"]
             except KeyError:
-                # no music-user-token URL param was found so user probably cancelled the auth
+                # no music-user-token URL param was found so likely user cancelled the auth
                 pass
             except Exception as error:
                 raise LoginFailed(f"Failed to authenticate with Apple '{error}'.")
@@ -186,9 +230,27 @@ async def get_config_entries(
             label="Music User Token",
             required=True,
             action="CONF_ACTION_AUTH",
-            description="You need to authenticate on Apple Music.",
+            description="Authenticate with Apple Music to retrieve a valid music user token.",
             action_label="Authenticate with Apple Music",
-            value=values.get(CONF_MUSIC_USER_TOKEN) if values else None,
+            value=values.get(CONF_MUSIC_USER_TOKEN)
+            if (
+                values
+                and isinstance(values.get(CONF_MUSIC_USER_TOKEN_TIMESTAMP), int)
+                and (
+                    values.get(CONF_MUSIC_USER_TOKEN_TIMESTAMP) > (time.time() - (3600 * 24 * 150))
+                )
+            )
+            else None,
+        ),
+        ConfigEntry(
+            key=CONF_MUSIC_USER_TOKEN_TIMESTAMP,
+            type=ConfigEntryType.INTEGER,
+            description="Timestamp music user token was updated.",
+            label="Music User Token Timestamp",
+            hidden=True,
+            required=True,
+            default_value=0,
+            value=values.get(CONF_MUSIC_USER_TOKEN_TIMESTAMP) if values else 0,
         ),
     )
 
@@ -219,13 +281,9 @@ class AppleMusicProvider(MusicProvider):
         ) as _file:
             self._decrypt_private_key = await _file.read()
 
-    @property
-    def supported_features(self) -> set[ProviderFeature]:
-        """Return the features supported by this Provider."""
-        return SUPPORTED_FEATURES
-
+    @use_cache()
     async def search(
-        self, search_query: str, media_types=list[MediaType] | None, limit: int = 5
+        self, search_query: str, media_types: list[MediaType] | None, limit: int = 5
     ) -> SearchResults:
         """Perform search on musicprovider.
 
@@ -322,24 +380,28 @@ class AppleMusicProvider(MusicProvider):
             elif item and item["id"]:
                 yield self._parse_playlist(item)
 
+    @use_cache()
     async def get_artist(self, prov_artist_id) -> Artist:
         """Get full artist details by id."""
         endpoint = f"catalog/{self._storefront}/artists/{prov_artist_id}"
         response = await self._get_data(endpoint, extend="editorialNotes")
         return self._parse_artist(response["data"][0])
 
+    @use_cache()
     async def get_album(self, prov_album_id) -> Album:
         """Get full album details by id."""
         endpoint = f"catalog/{self._storefront}/albums/{prov_album_id}"
         response = await self._get_data(endpoint, include="artists")
         return self._parse_album(response["data"][0])
 
+    @use_cache()
     async def get_track(self, prov_track_id) -> Track:
         """Get full track details by id."""
         endpoint = f"catalog/{self._storefront}/songs/{prov_track_id}"
         response = await self._get_data(endpoint, include="artists,albums")
         return self._parse_track(response["data"][0])
 
+    @use_cache()
     async def get_playlist(self, prov_playlist_id) -> Playlist:
         """Get full playlist details by id."""
         if self._is_catalog_id(prov_playlist_id):
@@ -350,6 +412,7 @@ class AppleMusicProvider(MusicProvider):
         response = await self._get_data(endpoint)
         return self._parse_playlist(response["data"][0])
 
+    @use_cache()
     async def get_album_tracks(self, prov_album_id) -> list[Track]:
         """Get all album tracks for given album id."""
         endpoint = f"catalog/{self._storefront}/albums/{prov_album_id}/tracks"
@@ -365,6 +428,7 @@ class AppleMusicProvider(MusicProvider):
             tracks.append(track)
         return tracks
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_playlist_tracks(self, prov_playlist_id, page: int = 0) -> list[Track]:
         """Get all playlist tracks for given playlist id."""
         if self._is_catalog_id(prov_playlist_id):
@@ -386,6 +450,7 @@ class AppleMusicProvider(MusicProvider):
                 result.append(parsed_track)
         return result
 
+    @use_cache(3600 * 24 * 7)  # cache for 7 days
     async def get_artist_albums(self, prov_artist_id) -> list[Album]:
         """Get a list of all albums for the given artist."""
         endpoint = f"catalog/{self._storefront}/artists/{prov_artist_id}/albums"
@@ -397,6 +462,7 @@ class AppleMusicProvider(MusicProvider):
             return []
         return [self._parse_album(album) for album in response if album["id"]]
 
+    @use_cache(3600 * 24 * 7)  # cache for 7 days
     async def get_artist_toptracks(self, prov_artist_id) -> list[Track]:
         """Get a list of 10 most popular tracks for the given artist."""
         endpoint = f"catalog/{self._storefront}/artists/{prov_artist_id}/view/top-songs"
@@ -426,6 +492,7 @@ class AppleMusicProvider(MusicProvider):
         """Remove track(s) from playlist."""
         raise NotImplementedError("Not implemented!")
 
+    @use_cache(3600 * 24)  # cache for 24 hours
     async def get_similar_tracks(self, prov_track_id, limit=25) -> list[Track]:
         """Retrieve a dynamic list of tracks based on the provided item."""
         # Note, Apple music does not have an official endpoint for similar tracks.
@@ -462,11 +529,9 @@ class AppleMusicProvider(MusicProvider):
             path=stream_url,
             can_seek=True,
             allow_seek=True,
-            # enforce caching because the apple streams are mp4 files with moov atom at the end
-            enable_cache=True,
         )
 
-    def _parse_artist(self, artist_obj):
+    def _parse_artist(self, artist_obj: dict[str, Any]) -> Artist:
         """Parse artist object to generic layout."""
         relationships = artist_obj.get("relationships", {})
         if (
@@ -502,14 +567,14 @@ class AppleMusicProvider(MusicProvider):
             },
         )
         if artwork := attributes.get("artwork"):
-            artist.metadata.images = [
+            artist.metadata.add_image(
                 MediaItemImage(
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
-                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
-            ]
+            )
         if genres := attributes.get("genreNames"):
             artist.metadata.genres = set(genres)
         if notes := attributes.get("editorialNotes"):
@@ -561,29 +626,31 @@ class AppleMusicProvider(MusicProvider):
             },
         )
         if artists := relationships.get("artists"):
-            album.artists = [self._parse_artist(artist) for artist in artists["data"]]
+            album.artists = UniqueList([self._parse_artist(artist) for artist in artists["data"]])
         elif artist_name := attributes.get("artistName"):
-            album.artists = [
-                ItemMapping(
-                    media_type=MediaType.ARTIST,
-                    provider=self.lookup_key,
-                    item_id=artist_name,
-                    name=artist_name,
-                )
-            ]
+            album.artists = UniqueList(
+                [
+                    ItemMapping(
+                        media_type=MediaType.ARTIST,
+                        provider=self.lookup_key,
+                        item_id=artist_name,
+                        name=artist_name,
+                    )
+                ]
+            )
         if release_date := attributes.get("releaseDate"):
             album.year = int(release_date.split("-")[0])
         if genres := attributes.get("genreNames"):
             album.metadata.genres = set(genres)
         if artwork := attributes.get("artwork"):
-            album.metadata.images = [
+            album.metadata.add_image(
                 MediaItemImage(
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
-                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
-            ]
+            )
         if album_copyright := attributes.get("copyright"):
             album.metadata.copyright = album_copyright
         if record_label := attributes.get("recordLabel"):
@@ -600,6 +667,13 @@ class AppleMusicProvider(MusicProvider):
         elif attributes.get("isCompilation"):
             album_type = AlbumType.COMPILATION
         album.album_type = album_type
+
+        # Try inference - override if it finds something more specific
+        # Apple Music doesn't seem to have version field
+        inferred_type = infer_album_type(album.name, "")
+        if inferred_type in (AlbumType.SOUNDTRACK, AlbumType.LIVE):
+            album.album_type = inferred_type
+
         return album
 
     def _parse_track(
@@ -656,14 +730,14 @@ class AppleMusicProvider(MusicProvider):
             if "data" in albums and len(albums["data"]) > 0:
                 track.album = self._parse_album(albums["data"][0])
         if artwork := attributes.get("artwork"):
-            track.metadata.images = [
+            track.metadata.add_image(
                 MediaItemImage(
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
-                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
-            ]
+            )
         if genres := attributes.get("genreNames"):
             track.metadata.genres = set(genres)
         if composers := attributes.get("composerName"):
@@ -672,7 +746,7 @@ class AppleMusicProvider(MusicProvider):
             track.external_ids.add((ExternalID.ISRC, isrc))
         return track
 
-    def _parse_playlist(self, playlist_obj) -> Playlist:
+    def _parse_playlist(self, playlist_obj: dict[str, Any]) -> Playlist:
         """Parse Apple Music playlist object to generic layout."""
         attributes = playlist_obj["attributes"]
         playlist_id = attributes["playParams"].get("globalId") or playlist_obj["id"]
@@ -696,18 +770,16 @@ class AppleMusicProvider(MusicProvider):
             url = artwork["url"]
             if artwork["width"] and artwork["height"]:
                 url = url.format(w=artwork["width"], h=artwork["height"])
-            playlist.metadata.images = [
+            playlist.metadata.add_image(
                 MediaItemImage(
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=url,
-                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
-            ]
+            )
         if description := attributes.get("description"):
             playlist.metadata.description = description.get("standard")
-        if checksum := attributes.get("lastModifiedDate"):
-            playlist.cache_checksum = checksum
         return playlist
 
     async def _get_all_items(self, endpoint, key="data", **kwargs) -> list[dict]:
@@ -864,8 +936,9 @@ class AppleMusicProvider(MusicProvider):
         self, license_url: str, key_id: bytes, uri: str, item_id: str
     ) -> str:
         """Get the decryption key for a song."""
-        cache_key = f"decryption_key.{item_id}"
-        if decryption_key := await self.mass.cache.get(cache_key, base_key=self.instance_id):
+        if decryption_key := await self.mass.cache.get(
+            key=item_id, provider=self.instance_id, category=CACHE_CATEGORY_DECRYPT_KEY
+        ):
             self.logger.debug("Decryption key for %s found in cache.", item_id)
             return decryption_key
         pssh = self._get_pssh(key_id)
@@ -888,7 +961,11 @@ class AppleMusicProvider(MusicProvider):
         decryption_key = key.key.hex()
         self.mass.create_task(
             self.mass.cache.set(
-                cache_key, decryption_key, expiration=7200, base_key=self.instance_id
+                key=item_id,
+                data=decryption_key,
+                expiration=7200,
+                provider=self.instance_id,
+                category=CACHE_CATEGORY_DECRYPT_KEY,
             )
         )
         return decryption_key

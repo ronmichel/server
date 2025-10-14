@@ -57,9 +57,10 @@ class FFMpeg(AsyncProcess):
         self.input_format = input_format
         self.collect_log_history = collect_log_history
         self.log_history: deque[str] = deque(maxlen=100)
-        self._stdin_task: asyncio.Task | None = None
-        self._logger_task: asyncio.Task | None = None
+        self._stdin_task: asyncio.Task[None] | None = None
+        self._logger_task: asyncio.Task[None] | None = None
         self._input_codec_parsed = False
+        stdin: bool | int
         if audio_input == "-" or isinstance(audio_input, AsyncGenerator):
             stdin = True
         else:
@@ -161,8 +162,8 @@ class FFMpeg(AsyncProcess):
 
     async def _feed_stdin(self) -> None:
         """Feed stdin with audio chunks from an AsyncGenerator."""
-        if TYPE_CHECKING:
-            self.audio_input: AsyncGenerator[bytes, None]
+        assert not isinstance(self.audio_input, str | int)
+
         generator_exhausted = False
         cancelled = False
         try:
@@ -199,6 +200,7 @@ async def get_ffmpeg_stream(
     extra_args: list[str] | None = None,
     chunk_size: int | None = None,
     extra_input_args: list[str] | None = None,
+    raise_ffmpeg_exception: bool = False,
 ) -> AsyncGenerator[bytes, None]:
     """
     Get the ffmpeg audio stream as async generator.
@@ -220,9 +222,12 @@ async def get_ffmpeg_stream(
         async for chunk in iterator:
             yield chunk
         if ffmpeg_proc.returncode not in (None, 0):
-            # dump the last 5 lines of the log in case of an unclean exit
             log_tail = "\n" + "\n".join(list(ffmpeg_proc.log_history)[-5:])
-            ffmpeg_proc.logger.error(log_tail)
+            if not raise_ffmpeg_exception:
+                # dump the last 5 lines of the log in case of an unclean exit
+                ffmpeg_proc.logger.error(log_tail)
+            else:
+                raise AudioError(log_tail)
 
 
 def get_ffmpeg_args(  # noqa: PLR0915
@@ -250,6 +255,10 @@ def get_ffmpeg_args(  # noqa: PLR0915
         "-ignore_unknown",
         "-protocol_whitelist",
         "file,hls,http,https,tcp,tls,crypto,pipe,data,fd,rtp,udp,concat",
+        "-probesize",
+        "8096",
+        "-analyzeduration",
+        "500000",  # 0.5 seconds should be enough to detect the format
     ]
     # collect input args
     if "-f" in extra_input_args:

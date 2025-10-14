@@ -10,13 +10,13 @@ from music_assistant.constants import (
 
 # Constants for players
 # both the http profile and icy didn't matter for me testing it.
-PLAYER_CONFIG_ENTRIES = (
+PLAYER_CONFIG_ENTRIES = [
     CONF_ENTRY_OUTPUT_CODEC,
     CONF_ENTRY_HTTP_PROFILE_DEFAULT_2,
     CONF_ENTRY_ICY_METADATA_HIDDEN_DISABLED,
     CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED,
     create_sample_rates_config_entry(max_sample_rate=192000, max_bit_depth=24),
-)
+]
 # player id is {device_id}{ZONE_SPLITTER}{zone_name}
 PLAYER_ZONE_SPLITTER = "___"  # must be url ok
 
@@ -28,12 +28,6 @@ MAIN_SWITCH_SOURCE_NON_NET = "audio1"
 PLAYER_ZONE2_SWITCH_SOURCE_NON_NET = "audio2"
 PLAYER_ZONE3_SWITCH_SOURCE_NON_NET = "audio3"
 PLAYER_ZONE4_SWITCH_SOURCE_NON_NET = "audio4"
-PLAYER_MAP_ZONE_SWITCH = {
-    "main": MAIN_SWITCH_SOURCE_NON_NET,
-    "zone2": PLAYER_ZONE2_SWITCH_SOURCE_NON_NET,
-    "zone3": PLAYER_ZONE3_SWITCH_SOURCE_NON_NET,
-    "zone4": PLAYER_ZONE4_SWITCH_SOURCE_NON_NET,
-}
 
 
 # MusicCast constants

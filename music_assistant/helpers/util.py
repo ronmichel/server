@@ -11,31 +11,36 @@ import re
 import shutil
 import socket
 import urllib.error
-import urllib.parse
 import urllib.request
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import suppress
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Self, TypeVar, cast
 from urllib.parse import urlparse
 
-import cchardet as chardet
+import chardet
 import ifaddr
+from music_assistant_models.enums import AlbumType
 from zeroconf import IPVersion
 
-from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.constants import LIVE_INDICATORS, SOUNDTRACK_INDICATORS, VERBOSE_LOG_LEVEL
 from music_assistant.helpers.process import check_output
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from chardet.resultdict import ResultDict
     from zeroconf.asyncio import AsyncServiceInfo
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderModuleType
+    from music_assistant.models.core_controller import CoreController
+    from music_assistant.models.provider import Provider
+
+from dataclasses import fields, is_dataclass
 
 LOGGER = logging.getLogger(__name__)
 
@@ -149,6 +154,18 @@ def parse_title_and_version(title: str, track_version: str | None = None) -> tup
     return title, version
 
 
+def infer_album_type(title: str, version: str) -> AlbumType:
+    """Infer album type by looking for live or soundtrack indicators."""
+    combined = f"{title} {version}".lower()
+    for pat in LIVE_INDICATORS:
+        if re.search(pat, combined):
+            return AlbumType.LIVE
+    for pat in SOUNDTRACK_INDICATORS:
+        if re.search(pat, combined):
+            return AlbumType.SOUNDTRACK
+    return AlbumType.UNKNOWN
+
+
 def strip_ads(line: str) -> str:
     """Strip Ads from line."""
     if ad_pattern.search(line):
@@ -221,37 +238,57 @@ def clean_stream_title(line: str) -> str:
     return line
 
 
-async def get_ip_addresses(include_ipv6: bool = False) -> tuple[str]:
+async def get_ip_addresses(include_ipv6: bool = False) -> tuple[str, ...]:
     """Return all IP-adresses of all network interfaces."""
 
-    def call() -> set[str]:
+    def call() -> tuple[str, ...]:
         result: list[tuple[int, str]] = []
+        # try to get the primary IP address
+        # this is the IP address of the default route
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _sock.settimeout(0)
+        try:
+            # doesn't even have to be reachable
+            _sock.connect(("10.254.254.254", 1))
+            primary_ip = _sock.getsockname()[0]
+        except Exception:
+            primary_ip = ""
+        finally:
+            _sock.close()
+        # get all IP addresses of all network interfaces
         adapters = ifaddr.get_adapters()
         for adapter in adapters:
             for ip in adapter.ips:
                 if ip.is_IPv6 and not include_ipv6:
                     continue
-                if ip.ip.startswith(("127", "169.254")):
+                ip_str = str(ip.ip)
+                if ip_str.startswith(("127", "169.254")):
                     # filter out IPv4 loopback/APIPA address
                     continue
-                if ip.ip.startswith(("::1", "::ffff:", "fe80")):
+                if ip_str.startswith(("::1", "::ffff:", "fe80")):
                     # filter out IPv6 loopback/link-local address
                     continue
-                if ip.ip.startswith(("192.168.",)):
+                if ip_str == primary_ip:
+                    score = 10
+                elif ip_str.startswith(("192.168.",)):
                     # we rank the 192.168 range a bit higher as its most
                     # often used as the private network subnet
                     score = 2
-                elif ip.ip.startswith(("172.", "10.", "192.")):
+                elif ip_str.startswith(("172.", "10.", "192.")):
                     # we rank the 172 range a bit lower as its most
                     # often used as the private docker network
                     score = 1
                 else:
                     score = 0
-                result.append((score, ip.ip))
+                result.append((score, ip_str))
         result.sort(key=lambda x: x[0], reverse=True)
         return tuple(ip[1] for ip in result)
 
     return await asyncio.to_thread(call)
+
+
+async def get_primary_ip_address() -> str | None:
+    """Return the primary IP address of the system."""
 
 
 async def is_port_in_use(port: int) -> bool:
@@ -265,7 +302,12 @@ async def is_port_in_use(port: int) -> bool:
                 return True
         return False
 
-    return await asyncio.to_thread(_is_port_in_use)
+    try:
+        if await check_output(f"lsof -i :{port}"):
+            return True
+    except Exception:
+        # lsof not available (or some other error), fallback to socket check
+        return await asyncio.to_thread(_is_port_in_use)
 
 
 async def select_free_port(range_start: int, range_end: int) -> int:
@@ -315,17 +357,17 @@ async def get_folder_size(folderpath: str) -> float:
 def get_changed_keys(
     dict1: dict[str, Any],
     dict2: dict[str, Any],
-    ignore_keys: list[str] | None = None,
     recursive: bool = False,
 ) -> set[str]:
     """Compare 2 dicts and return set of changed keys."""
-    return set(get_changed_values(dict1, dict2, ignore_keys, recursive).keys())
+    # TODO: Check with Marcel whether we should calculate new dicts based on ignore_keys
+    return set(get_changed_dict_values(dict1, dict2, recursive).keys())
+    # return set(get_changed_dict_values(dict1, dict2, ignore_keys, recursive).keys())
 
 
-def get_changed_values(
+def get_changed_dict_values(
     dict1: dict[str, Any],
     dict2: dict[str, Any],
-    ignore_keys: list[str] | None = None,
     recursive: bool = False,
 ) -> dict[str, tuple[Any, Any]]:
     """
@@ -341,22 +383,52 @@ def get_changed_values(
         return {key: (None, value) for key, value in dict1.items()}
     changed_values = {}
     for key, value in dict2.items():
-        if ignore_keys and key in ignore_keys:
+        if isinstance(value, dict) and isinstance(dict1[key], dict) and recursive:
+            changed_subvalues = get_changed_dict_values(dict1[key], value, recursive)
+            for subkey, subvalue in changed_subvalues.items():
+                changed_values[f"{key}.{subkey}"] = subvalue
             continue
         if key not in dict1:
             changed_values[key] = (None, value)
-        elif isinstance(value, dict) or isinstance(dict1[key], dict):
-            changed_subvalues = get_changed_values(dict1[key], value, ignore_keys, recursive)
-            if recursive:
-                changed_values.update(changed_subvalues)
-            elif changed_subvalues:
-                changed_values[key] = (dict1[key], value)
-        elif dict1[key] != value:
+            continue
+        if dict1[key] != value:
             changed_values[key] = (dict1[key], value)
     return changed_values
 
 
-def empty_queue(q: asyncio.Queue[T]) -> None:
+def get_changed_dataclass_values(
+    obj1: T,
+    obj2: T,
+    recursive: bool = False,
+) -> dict[str, tuple[Any, Any]]:
+    """
+    Compare 2 dataclass instances of the same type and return dict of changed field values.
+
+    dict key is the changed field name, value is tuple of old and new values.
+    """
+    if not (is_dataclass(obj1) and is_dataclass(obj2)):
+        raise ValueError("Both objects must be dataclass instances")
+
+    changed_values: dict[str, tuple[Any, Any]] = {}
+    for field in fields(obj1):
+        val1 = getattr(obj1, field.name, None)
+        val2 = getattr(obj2, field.name, None)
+        if recursive and is_dataclass(val1) and is_dataclass(val2):
+            sub_changes = get_changed_dataclass_values(val1, val2, recursive)
+            for sub_field, sub_value in sub_changes.items():
+                changed_values[f"{field.name}.{sub_field}"] = sub_value
+            continue
+        if recursive and isinstance(val1, dict) and isinstance(val2, dict):
+            sub_changes = get_changed_dict_values(val1, val2, recursive=recursive)
+            for sub_field, sub_value in sub_changes.items():
+                changed_values[f"{field.name}.{sub_field}"] = sub_value
+            continue
+        if val1 != val2:
+            changed_values[field.name] = (val1, val2)
+    return changed_values
+
+
+def empty_queue[T](q: asyncio.Queue[T]) -> None:
     """Empty an asyncio Queue."""
     for _ in range(q.qsize()):
         try:
@@ -371,21 +443,6 @@ async def install_package(package: str) -> None:
     LOGGER.debug("Installing python package %s", package)
     args = ["uv", "pip", "install", "--no-cache", "--find-links", HA_WHEELS, package]
     return_code, output = await check_output(*args)
-
-    if return_code != 0 and "Permission denied" in output.decode():
-        # try again with regular pip
-        # uv pip seems to have issues with permissions on docker installs
-        args = [
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--no-input",
-            "--find-links",
-            HA_WHEELS,
-            package,
-        ]
-        return_code, output = await check_output(*args)
-
     if return_code != 0:
         msg = f"Failed to install package {package}\n{output.decode()}"
         raise RuntimeError(msg)
@@ -406,7 +463,7 @@ async def get_package_version(pkg_name: str) -> str | None:
 async def is_hass_supervisor() -> bool:
     """Return if we're running inside the HA Supervisor (e.g. HAOS)."""
 
-    def _check():
+    def _check() -> bool:
         try:
             urllib.request.urlopen("http://supervisor/core", timeout=1)
         except urllib.error.URLError as err:
@@ -424,7 +481,9 @@ async def load_provider_module(domain: str, requirements: list[str]) -> Provider
 
     @lru_cache
     def _get_provider_module(domain: str) -> ProviderModuleType:
-        return importlib.import_module(f".{domain}", "music_assistant.providers")
+        return cast(
+            "ProviderModuleType", importlib.import_module(f".{domain}", "music_assistant.providers")
+        )
 
     # ensure module requirements are met
     for requirement in requirements:
@@ -474,8 +533,8 @@ async def get_free_space(folder: str) -> float:
     def _get_free_space(folder: str) -> float:
         """Return free space on given folderpath in GB."""
         try:
-            if res := shutil.disk_usage(folder):
-                return res.free / float(1 << 30)
+            res = shutil.disk_usage(folder)
+            return res.free / float(1 << 30)
         except (FileNotFoundError, OSError, PermissionError):
             return 0.0
 
@@ -488,8 +547,8 @@ async def get_free_space_percentage(folder: str) -> float:
     def _get_free_space(folder: str) -> float:
         """Return free space on given folderpath in GB."""
         try:
-            if res := shutil.disk_usage(folder):
-                return res.free / res.total * 100
+            res = shutil.disk_usage(folder)
+            return res.free / res.total * 100
         except (FileNotFoundError, OSError, PermissionError):
             return 0.0
 
@@ -528,8 +587,8 @@ def get_primary_ip_address_from_zeroconf(discovery_info: AsyncServiceInfo) -> st
     return None
 
 
-def get_port_from_zeroconf(discovery_info: AsyncServiceInfo) -> str | None:
-    """Get primary IP address from zeroconf discovery info."""
+def get_port_from_zeroconf(discovery_info: AsyncServiceInfo) -> int | None:
+    """Get port from zeroconf discovery info."""
     return discovery_info.port
 
 
@@ -542,11 +601,12 @@ async def close_async_generator(agen: AsyncGenerator[Any, None]) -> None:
     await agen.aclose()
 
 
-async def detect_charset(data: bytes, fallback="utf-8") -> str:
+async def detect_charset(data: bytes, fallback: str = "utf-8") -> str:
     """Detect charset of raw data."""
     try:
-        detected = await asyncio.to_thread(chardet.detect, data)
+        detected: ResultDict = await asyncio.to_thread(chardet.detect, data)
         if detected and detected["encoding"] and detected["confidence"] > 0.75:
+            assert isinstance(detected["encoding"], str)  # for type checking
             return detected["encoding"]
     except Exception as err:
         LOGGER.debug("Failed to detect charset: %s", err)
@@ -587,6 +647,29 @@ def percentage(part: float, whole: float) -> int:
     return int(100 * float(part) / float(whole))
 
 
+def validate_announcement_chime_url(url: str) -> bool:
+    """Validate announcement chime URL format."""
+    if not url or not url.strip():
+        return True  # Empty URL is valid
+
+    try:
+        parsed = urlparse(url.strip())
+
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        if not parsed.netloc:
+            return False
+
+        path_lower = parsed.path.lower()
+        audio_extensions = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac")
+
+        return any(path_lower.endswith(ext) for ext in audio_extensions)
+
+    except Exception:
+        return False
+
+
 class TaskManager:
     """
     Helper class to run many tasks at once.
@@ -599,25 +682,26 @@ class TaskManager:
     def __init__(self, mass: MusicAssistant, limit: int = 0):
         """Initialize the TaskManager."""
         self.mass = mass
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
         self._semaphore = asyncio.Semaphore(limit) if limit else None
 
-    def create_task(self, coro: Coroutine) -> asyncio.Task:
+    def create_task(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         """Create a new task and add it to the manager."""
         task = self.mass.create_task(coro)
         self._tasks.append(task)
         return task
 
-    async def create_task_with_limit(self, coro: Coroutine) -> None:
+    async def create_task_with_limit(self, coro: Coroutine[Any, Any, None]) -> None:
         """Create a new task with semaphore limit."""
         assert self._semaphore is not None
 
-        def task_done_callback(_task: asyncio.Task) -> None:
+        def task_done_callback(_task: asyncio.Task[None]) -> None:
+            assert self._semaphore is not None  # for type checking
             self._tasks.remove(task)
             self._semaphore.release()
 
         await self._semaphore.acquire()
-        task: asyncio.Task = self.create_task(coro)
+        task: asyncio.Task[None] = self.create_task(coro)
         task.add_done_callback(task_done_callback)
 
     async def __aenter__(self) -> Self:
@@ -634,13 +718,14 @@ class TaskManager:
         if len(self._tasks) > 0:
             await asyncio.wait(self._tasks)
             self._tasks.clear()
+        return None
 
 
 _R = TypeVar("_R")
 _P = ParamSpec("_P")
 
 
-def lock(
+def lock[**P, R](  # type: ignore[valid-type]
     func: Callable[_P, Awaitable[_R]],
 ) -> Callable[_P, Coroutine[Any, Any, _R]]:
     """Call async function using a Lock."""
@@ -650,7 +735,7 @@ def lock(
         """Call async function using the throttler with retries."""
         if not (func_lock := getattr(func, "lock", None)):
             func_lock = asyncio.Lock()
-            func.lock = func_lock
+            func.lock = func_lock  # type: ignore[attr-defined]
         async with func_lock:
             return await func(*args, **kwargs)
 
@@ -664,7 +749,7 @@ class TimedAsyncGenerator:
     Source: https://medium.com/@dmitry8912/implementing-timeouts-in-pythons-asynchronous-generators-f7cbaa6dc1e9
     """
 
-    def __init__(self, iterable, timeout=0):
+    def __init__(self, iterable: AsyncIterator[Any], timeout: int = 0):
         """
         Initialize the AsyncTimedIterable.
 
@@ -674,10 +759,10 @@ class TimedAsyncGenerator:
         """
 
         class AsyncTimedIterator:
-            def __init__(self):
+            def __init__(self) -> None:
                 self._iterator = iterable.__aiter__()
 
-            async def __anext__(self):
+            async def __anext__(self) -> Any:
                 result = await asyncio.wait_for(self._iterator.__anext__(), int(timeout))
                 if not result:
                     raise StopAsyncIteration
@@ -685,6 +770,27 @@ class TimedAsyncGenerator:
 
         self._factory = AsyncTimedIterator
 
-    def __aiter__(self):
+    def __aiter__(self):  # type: ignore[no-untyped-def]
         """Return the async iterator."""
         return self._factory()
+
+
+def guard_single_request[ProviderT: "Provider | CoreController", **P, R](
+    func: Callable[Concatenate[ProviderT, P], Coroutine[Any, Any, R]],
+) -> Callable[Concatenate[ProviderT, P], Coroutine[Any, Any, R]]:
+    """Guard single request to a function."""
+
+    @functools.wraps(func)
+    async def wrapper(self: ProviderT, *args: P.args, **kwargs: P.kwargs) -> R:
+        mass = self.mass
+        # create a task_id dynamically based on the function and args/kwargs
+        cache_key_parts = [func.__class__.__name__, func.__name__, *args]
+        for key in sorted(kwargs.keys()):
+            cache_key_parts.append(f"{key}{kwargs[key]}")
+        task_id = ".".join(map(str, cache_key_parts))
+        task: asyncio.Task[R] = mass.create_task(
+            func, self, *args, **kwargs, task_id=task_id, abort_existing=False
+        )
+        return await task
+
+    return wrapper

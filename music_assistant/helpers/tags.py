@@ -20,7 +20,7 @@ from music_assistant_models.errors import InvalidDataError
 from music_assistant.constants import MASS_LOGGER_NAME, UNKNOWN_ARTIST
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.process import AsyncProcess
-from music_assistant.helpers.util import try_parse_int
+from music_assistant.helpers.util import infer_album_type, try_parse_int
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.tags")
 
@@ -32,16 +32,18 @@ LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.tags")
 TAG_SPLITTER = ";"
 
 
-def clean_tuple(values: Iterable[str]) -> tuple:
+def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
     """Return a tuple with all empty values removed."""
     return tuple(x.strip() for x in values if x not in (None, "", " "))
 
 
-def split_items(org_str: str, allow_unsafe_splitters: bool = False) -> tuple[str, ...]:
+def split_items(
+    org_str: str | list[str] | tuple[str, ...] | None, allow_unsafe_splitters: bool = False
+) -> tuple[str, ...]:
     """Split up a tags string by common splitter."""
     if org_str is None:
         return ()
-    if isinstance(org_str, list):
+    if isinstance(org_str, tuple | list):
         final_items: list[str] = []
         for item in org_str:
             final_items.extend(split_items(item, allow_unsafe_splitters))
@@ -312,28 +314,32 @@ class AudioTags:
         """Return albumtype tag if present."""
         if self.tags.get("compilation", "") == "1":
             return AlbumType.COMPILATION
+
         tag = (
             self.tags.get("musicbrainzalbumtype")
             or self.tags.get("albumtype")
             or self.tags.get("releasetype")
         )
-        if tag is None:
-            return AlbumType.UNKNOWN
-        # the album type tag is messy within id3 and may even contain multiple types
-        # try to parse one in order of preference
-        for album_type in (
-            AlbumType.COMPILATION,
-            AlbumType.EP,
-            AlbumType.SINGLE,
-            AlbumType.ALBUM,
-        ):
-            if album_type.value in tag.lower():
-                return album_type
 
-        return AlbumType.UNKNOWN
+        if tag is not None:
+            # try to parse one in order of preference
+            for album_type in (
+                AlbumType.LIVE,
+                AlbumType.SOUNDTRACK,
+                AlbumType.COMPILATION,
+                AlbumType.EP,
+                AlbumType.SINGLE,
+                AlbumType.ALBUM,
+            ):
+                if album_type.value in tag.lower():
+                    return album_type
+
+        # No valid tag found, try inference from album title
+        album_title = self.tags.get("album", "")
+        return infer_album_type(album_title, "")
 
     @property
-    def isrc(self) -> tuple[str]:
+    def isrc(self) -> tuple[str, ...]:
         """Return isrc tag(s)."""
         for tag_name in ("isrc", "tsrc"):
             if tag := self.tags.get(tag_name):
@@ -381,24 +387,44 @@ class AudioTags:
 
     @property
     def track_loudness(self) -> float | None:
-        """Try to read/calculate the integrated loudness from the tags."""
-        if (tag := self.tags.get("r128trackgain")) is not None:
-            return -23 - float(int(tag.split(" ")[0]) / 256)
-        if (tag := self.tags.get("replaygaintrackgain")) is not None:
-            return -18 - float(tag.split(" ")[0])
+        """Try to read/calculate the integrated loudness from the tags (track level)."""
+        if tag := self.tags.get("r128trackgain"):
+            try:
+                gain_adjustment = int(tag.split(" ")[0]) / 256
+                return -23 - gain_adjustment
+            except (ValueError, IndexError) as e:
+                LOGGER.warning(f"Invalid r128trackgain tag value: {tag!r} — {e}")
+
+        if tag := self.tags.get("replaygaintrackgain"):
+            try:
+                gain_adjustment = float(tag.split(" ")[0])
+                return -18 - gain_adjustment
+            except (ValueError, IndexError) as e:
+                LOGGER.warning(f"Invalid replaygaintrackgain tag value: {tag!r} — {e}")
+
         return None
 
     @property
     def track_album_loudness(self) -> float | None:
         """Try to read/calculate the integrated loudness from the tags (album level)."""
         if tag := self.tags.get("r128albumgain"):
-            return -23 - float(int(tag.split(" ")[0]) / 256)
-        if (tag := self.tags.get("replaygainalbumgain")) is not None:
-            return -18 - float(tag.split(" ")[0])
+            try:
+                gain_adjustment = int(tag.split(" ")[0]) / 256
+                return -23 - gain_adjustment
+            except (ValueError, IndexError) as e:
+                LOGGER.warning(f"Invalid r128albumgain tag value: {tag!r} — {e}")
+
+        if tag := self.tags.get("replaygainalbumgain"):
+            try:
+                gain_adjustment = float(tag.split(" ")[0])
+                return -18 - gain_adjustment
+            except (ValueError, IndexError) as e:
+                LOGGER.warning(f"Invalid replaygainalbumgain tag value: {tag!r} — {e}")
+
         return None
 
     @classmethod
-    def parse(cls, raw: dict) -> AudioTags:
+    def parse(cls, raw: dict[str, Any]) -> AudioTags:
         """Parse instance from raw ffmpeg info output."""
         audio_stream = next((x for x in raw["streams"] if x["codec_type"] == "audio"), None)
         if audio_stream is None:
@@ -415,7 +441,9 @@ class AudioTags:
             if stream.get("codec_type") == "video":
                 continue
             for key, value in stream.get("tags", {}).items():
-                alt_key = key.lower().replace(" ", "").replace("_", "").replace("-", "")
+                alt_key = key.lower()
+                for char in [" ", "_", "-", "/"]:
+                    alt_key = alt_key.replace(char, "")
                 if alt_key in tags:
                     continue
                 tags[alt_key] = value
@@ -435,7 +463,7 @@ class AudioTags:
             filename=raw["format"]["filename"],
         )
 
-    def get(self, key: str, default=None) -> Any:
+    def get(self, key: str, default: Any | None = None) -> Any:
         """Get tag by key."""
         return self.tags.get(key, default)
 
@@ -532,7 +560,7 @@ def get_file_duration(input_file: str) -> float:
         # extract duration from ffmpeg output
         duration_str = res.split("time=")[-1].split(" ")[0].strip()
         duration_parts = duration_str.split(":")
-        duration = 0
+        duration = 0.0
         for part in duration_parts:
             duration = duration * 60 + float(part)
         return duration
@@ -547,10 +575,11 @@ def parse_tags_mutagen(input_file: str) -> dict[str, Any]:
 
     NOT Async friendly.
     """
-    result = {}
+    result: dict[str, Any] = {}
     try:
         # TODO: extend with more tags and file types!
-        tags = mutagen.File(input_file)
+        # https://mutagen.readthedocs.io/en/latest/user/gettingstarted.html
+        tags = mutagen.File(input_file)  # type: ignore[attr-defined]
         if tags is None or not tags.tags:
             return result
         tags = dict(tags.tags)
@@ -604,7 +633,7 @@ async def get_embedded_image(input_file: str) -> bytes | None:
 
     Input_file may be a (local) filename or URL accessible by ffmpeg.
     """
-    args = (
+    args = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -617,7 +646,7 @@ async def get_embedded_image(input_file: str) -> bytes | None:
         "-f",
         "mjpeg",
         "-",
-    )
+    ]
     async with AsyncProcess(
         args, stdin=False, stdout=True, stderr=None, name="ffmpeg_image"
     ) as ffmpeg:
